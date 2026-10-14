@@ -3,6 +3,7 @@
 import functools
 import io
 import os
+import struct
 import subprocess
 from xml.sax.saxutils import quoteattr
 
@@ -50,11 +51,24 @@ def input_text_types(arg):
     return "".join(buff)
 
 
+COLOUR = (200, 30, 60)  # every fake screen is filled with this, so a decoder that mixes up channels shows
+
+
 @functools.lru_cache
 def png(width, height):
     buf = io.BytesIO()
-    PILImage.new("RGB", (width, height)).save(buf, "PNG")
+    PILImage.new("RGB", (width, height), COLOUR).save(buf, "PNG")
     return buf.getvalue()
+
+
+@functools.lru_cache
+def raw_frame(width, height, pixel_format=1, header=16):
+    """What `screencap` without -p writes: width, height, pixel format (1 = RGBA_8888), then on Android 10+ a
+    colour space, then the pixels."""
+    fields = (width, height, pixel_format, 0)[: header // 4]
+    bpp = 4 if pixel_format in (1, 2) else 2
+    pixel = bytes([*COLOUR, 255]) if bpp == 4 else b"\x00\x00"
+    return struct.pack(f"<{len(fields)}I", *fields) + pixel * (width * height)
 
 
 class FakeClock:
@@ -76,6 +90,8 @@ class FakeDevice:
     def __init__(self, scratch):
         self.calls = []
         self.size = (1080, 2400)
+        self.pixel_format = 1
+        self.raw_header = 16
         self.activity = "com.android.settings/.Settings"
         self.emu_reply = "OK\n"
         self.pieces = []  # what each `input text` call typed, as the focused field would receive it
@@ -94,6 +110,8 @@ class FakeDevice:
             return self._screens.pop(0) if len(self._screens) > 1 else self._screens[0]
         if args == ("exec-out", "screencap", "-p"):
             return png(*self.size)
+        if args == ("exec-out", "screencap"):
+            return raw_frame(*self.size, self.pixel_format, self.raw_header)
         if args == ("shell", "wm", "size"):
             return f"Physical size: {self.size[0]}x{self.size[1]}\n"
         if args[:2] == ("shell", "dumpsys"):

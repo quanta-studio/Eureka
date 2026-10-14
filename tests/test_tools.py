@@ -42,6 +42,7 @@ def test_observe_returns_activity_tree_and_a_downscaled_screenshot(device):
         '[1] EditText "" id=search',
     ]
     assert isinstance(image, droid_mcp.Image)
+    assert image.to_image_content().mimeType == "image/jpeg"
     assert PILImage.open(io.BytesIO(image.data)).size == (540, 1200)
 
 
@@ -51,7 +52,7 @@ def test_screenshot_can_be_turned_off_per_call(device):
     out = droid_mcp.observe(screenshot=False)
 
     assert len(out) == 1
-    assert ("exec-out", "screencap", "-p") not in device.calls
+    assert not any(c[:2] == ("exec-out", "screencap") for c in device.calls)
 
 
 def test_tap_hits_the_indexed_element_and_returns_the_resulting_screen(device):
