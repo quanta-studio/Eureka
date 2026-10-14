@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shlex
+import struct
 import subprocess
 import time
 import xml.etree.ElementTree as ET
@@ -155,15 +156,14 @@ class AndroidBackend:
         )
 
     def settle(self, timeout=5.0):
-        """Dump until two consecutive trees match (crude idle detection)."""
-        prev, xml, end = None, "", time.time() + timeout
-        while time.time() < end:
-            xml = self.ui_xml()
-            h = hashlib.md5(xml.encode()).hexdigest()
-            if xml and h == prev:
-                break
-            prev = h
+        """One dump of the settled UI, retried while the device produces none."""
+        # uiautomator waits for the UI to go idle before it dumps, so there is no second dump to compare against:
+        # that only doubled the cost of every step.
+        end = time.time() + timeout
+        xml = self.ui_xml()
+        while not xml and time.time() < end:
             time.sleep(0.3)
+            xml = self.ui_xml()
         if not xml:
             raise RuntimeError("The device returned no UI tree; its screen is probably off or locked.")
         return xml
@@ -237,14 +237,20 @@ class AndroidBackend:
         raise ValueError(f"No element [{element}]: the last observation listed [0] to [{count - 1}].")
 
     def screenshot(self):
-        png = self.adb("exec-out", "screencap", "-p", binary=True)
-        im = PILImage.open(io.BytesIO(png))
+        # Raw pixels skip the PNG encode on the device, which is most of a capture's cost.
+        raw = self.adb("exec-out", "screencap", binary=True)
+        w, h, fmt = struct.unpack_from("<3I", raw) if len(raw) >= 12 else (0, 0, 0)
+        header = len(raw) - w * h * 4  # 12 bytes, or 16 from Android 10 on (a colour-space field)
+        if fmt in (1, 2) and header in (12, 16):  # RGBA_8888 / RGBX_8888
+            im = PILImage.frombuffer("RGBA", (w, h), raw[header:], "raw", "RGBA", 0, 1).convert("RGB")
+        else:
+            im = PILImage.open(io.BytesIO(self.adb("exec-out", "screencap", "-p", binary=True))).convert("RGB")
         self.scale = 1.0
         if im.width > MAX_W:
             self.scale = im.width / MAX_W
             im = im.resize((MAX_W, round(im.height / self.scale)))
         buf = io.BytesIO()
-        im.save(buf, "PNG", optimize=True)
+        im.save(buf, "JPEG", quality=80)  # a fraction of the bytes of a PNG, and far cheaper to encode
         return buf.getvalue()
 
     def current_activity(self):
@@ -335,7 +341,7 @@ def _observe(action="observe", args=None, screenshot=True):
     header = f"activity: {dev.current_activity()}\n" + ("keyboard: showing\n" if dev.keyboard else "")
     out = [header + tree]
     if screenshot:
-        out.append(Image(data=dev.screenshot(), format="png"))
+        out.append(Image(data=dev.screenshot(), format="jpeg"))
     return out
 
 

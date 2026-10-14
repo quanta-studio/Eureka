@@ -78,7 +78,8 @@ All three are rebuilt on every call, so indices are only valid against the most 
 
 - **There are two coordinate spaces.** Tap points, swipes, and `adb input` use device pixels. `tap_xy` takes screenshot pixels and multiplies by `dev.scale`.
 - **`dev.scale` is only set by `screenshot()`.** Until a screenshot has been taken in the process, it is 1.0 and `tap_xy` coordinates are treated as device pixels.
-- **`settle()` dominates latency.** It needs two identical consecutive dumps, and each `uiautomator dump` costs 2.5 to 3 seconds: over a second to start a Java process, then its own wait for the UI to go idle. If the tree never stabilises within 5 seconds it returns the last dump; if the device produces no tree at all (screen off) it raises.
+- **A step costs one `uiautomator dump`, 2.5 to 3 seconds.** Over a second of that is starting a Java process; the rest is uiautomator's own wait for the UI to go idle, which is why `settle()` does not dump a second time to compare. If the device produces no tree at all (screen off), it retries for 5 seconds and then raises.
+- **Screenshots are captured as raw pixels and encoded as JPEG on the host.** Encoding a PNG on the device was most of a capture's cost. `screencap -p` remains the fallback for pixel formats other than RGBA_8888 and RGBX_8888.
 - **The dump is one `adb exec-out` round trip that deletes the file before and after.** `uiautomator` can report success without writing anything, and reading a leftover file would present a stale screen as current.
 - **Typed text goes through the device's shell**, so `text()` shell-quotes it. Dropping the quoting turns `type_text` into remote command execution.
 - **`input text` is the weak link for typing.** It handles printable ASCII only, turns `%s` into a space, and on a slow emulator silently drops whatever one call has not typed within about 10 seconds, hence the short `TYPE_CHUNK` pieces.

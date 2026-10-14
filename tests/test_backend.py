@@ -5,7 +5,7 @@ import pytest
 from PIL import Image as PILImage
 
 import droid_mcp
-from tests.fakes import hierarchy, node
+from tests.fakes import COLOUR, hierarchy, node
 
 
 @pytest.fixture
@@ -71,22 +71,12 @@ def test_size_is_parsed_once_and_cached(device):
     assert device.calls.count(("shell", "wm", "size")) == 1
 
 
-def test_settle_returns_as_soon_as_two_consecutive_dumps_match(device):
-    loading, loaded = hierarchy(node(text="Loading")), hierarchy(node(text="Loaded"))
-    device.show(loading, loaded, loaded, hierarchy(node(text="Later")))
+def test_settle_takes_a_single_dump_because_uiautomator_already_waits_for_idle(device):
+    loaded = hierarchy(node(text="Loaded"))
+    device.show(loaded, hierarchy(node(text="Later")))
 
     assert device.backend.settle() == loaded
-    assert device.dumps == 3
-
-
-def test_settle_gives_up_at_the_timeout_and_returns_the_latest_dump(device):
-    frames = [hierarchy(node(text=f"frame {i}")) for i in range(100)]
-    device.show(*frames)
-
-    xml = device.backend.settle(timeout=5.0)
-
-    assert xml == frames[device.dumps - 1]
-    assert 1 < device.dumps < len(frames)
+    assert device.dumps == 1
 
 
 def test_settle_keeps_polling_while_the_device_produces_no_tree(device):
@@ -115,9 +105,30 @@ def test_screenshot_is_downscaled_to_the_width_cap_and_records_the_scale(device)
 
     shot = PILImage.open(io.BytesIO(device.backend.screenshot()))
 
-    assert shot.format == "PNG"
+    assert shot.format == "JPEG"
     assert shot.size == (540, 1200)
     assert device.backend.scale == 2.0
+
+
+@pytest.mark.parametrize("header", [12, 16], ids=["before Android 10", "Android 10+"])
+def test_screenshot_reads_raw_pixels_without_mixing_up_channels(device, header):
+    device.raw_header = header
+
+    shot = PILImage.open(io.BytesIO(device.backend.screenshot())).convert("RGB")
+
+    assert ("exec-out", "screencap") in device.calls
+    assert ("exec-out", "screencap", "-p") not in device.calls
+    assert all(abs(a - b) <= 4 for a, b in zip(shot.getpixel((270, 600)), COLOUR, strict=True))
+
+
+def test_screenshot_falls_back_to_png_for_a_pixel_format_it_cannot_read(device):
+    device.pixel_format = 4  # RGB_565
+
+    shot = PILImage.open(io.BytesIO(device.backend.screenshot())).convert("RGB")
+
+    assert ("exec-out", "screencap", "-p") in device.calls
+    assert shot.size == (540, 1200)
+    assert all(abs(a - b) <= 4 for a, b in zip(shot.getpixel((270, 600)), COLOUR, strict=True))
 
 
 def test_screenshot_narrower_than_the_cap_is_left_alone(device):
