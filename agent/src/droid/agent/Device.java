@@ -23,6 +23,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
@@ -31,6 +32,7 @@ import java.util.Map;
 
 /** One UiAutomation connection, held for the life of the process, and everything done through it. */
 final class Device {
+    private static final long CONNECT_TIMEOUT_MS = 5_000;
     private static final long LAUNCH_TIMEOUT_MS = 10_000;
     private static final long FIELD_WAIT_MS = 2_000; // for a focused field to take typed text
 
@@ -69,6 +71,12 @@ final class Device {
     }
 
     /** Connects the way `uiautomator` does, which the shell user is allowed to. */
+    /**
+     * Connects the way `uiautomator` does, which the shell user is allowed to. Only one client may hold the
+     * connection, and while another does, connect() returns without error but never connects (Android 16), so the
+     * result is checked rather than trusted. An agent told to quit a moment ago may still be letting go, hence the
+     * retries, each with fresh objects since a failed connection cannot be reused.
+     */
     static Device connect() throws Exception {
         HandlerThread events = new HandlerThread("a11y-events");
         events.start();
@@ -78,28 +86,54 @@ final class Device {
         Constructor<UiAutomation> newAutomation = UiAutomation.class.getDeclaredConstructor(
                 Looper.class, Class.forName("android.app.IUiAutomationConnection"));
         newAutomation.setAccessible(true);
-        UiAutomation ui = newAutomation.newInstance(events.getLooper(), newConnection.newInstance());
         // Leave TalkBack and other accessibility services running, unlike plain connect().
         Method connect = UiAutomation.class.getDeclaredMethod("connect", int.class);
         connect.setAccessible(true);
-        for (int attempt = 0; ; attempt++) {
+        long deadline = SystemClock.uptimeMillis() + CONNECT_TIMEOUT_MS;
+        Throwable refused = null;
+        while (true) {
+            Object connection = newConnection.newInstance();
+            UiAutomation ui = newAutomation.newInstance(events.getLooper(), connection);
             try {
                 connect.invoke(ui, UiAutomation.FLAG_DONT_SUPPRESS_ACCESSIBILITY_SERVICES);
-                break;
-            } catch (java.lang.reflect.InvocationTargetException e) {
-                // An agent we just told to quit may not have released its connection yet.
-                if (attempt == 30) {
-                    throw new IllegalStateException("could not connect UiAutomation: " + e.getCause(), e.getCause());
+                if (connected(ui, 1000)) {
+                    AccessibilityServiceInfo info = ui.getServiceInfo();
+                    info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+                            | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
+                            | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
+                    ui.setServiceInfo(info);
+                    return new Device(ui);
                 }
-                Thread.sleep(100);
+            } catch (InvocationTargetException e) {
+                refused = e.getCause();
+            }
+            try {
+                connectionClass.getMethod("disconnect").invoke(connection); // give up our half of the registration
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+                // it never got that far
+            }
+            if (SystemClock.uptimeMillis() >= deadline) {
+                throw new IllegalStateException("could not connect to UI automation: something else on the device is"
+                        + " using it, such as uiautomator, an Appium session or an instrumentation test"
+                        + (refused == null ? "" : " (" + refused + ")"));
+            }
+            Thread.sleep(200);
+        }
+    }
+
+    private static boolean connected(UiAutomation ui, long timeoutMs) {
+        long end = SystemClock.uptimeMillis() + timeoutMs;
+        while (true) {
+            try {
+                ui.getServiceInfo(); // throws until the connection is up
+                return true;
+            } catch (IllegalStateException notYet) {
+                if (SystemClock.uptimeMillis() >= end) {
+                    return false;
+                }
+                SystemClock.sleep(20);
             }
         }
-        AccessibilityServiceInfo info = ui.getServiceInfo();
-        info.flags |= AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
-                | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS
-                | AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS;
-        ui.setServiceInfo(info);
-        return new Device(ui);
     }
 
     void disconnect() {

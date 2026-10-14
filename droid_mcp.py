@@ -17,6 +17,7 @@ Env:   ANDROID_SERIAL=emulator-5554  SHOT_MAX_W=540  TRAJ_LOG=traj.jsonl
        DROID_AGENT=1 drives the device through droid-agent (agent/build.sh) instead of uiautomator and input
 """
 
+import contextlib
 import hashlib
 import io
 import json
@@ -339,6 +340,7 @@ class AgentBackend(AndroidBackend):
         super().__init__(serial)
         self._conn = None  # (socket, reader) to the agent, opened on first use
         self._shell = None  # the `adb shell` the agent runs under; the agent exits when it does
+        self._port = None  # host port adb forwards to the agent's socket
         self._activity = None  # foreground activity the agent reported with the last dump
 
     # ---------- connection ----------
@@ -358,7 +360,12 @@ class AgentBackend(AndroidBackend):
                 stdout=log,
                 stderr=log,
             )
-            port = int(self.adb("forward", "tcp:0", f"localabstract:{AGENT_SOCKET}"))
+            # A server that exited without closing leaves its forward; ours replaces its agent, so drop them.
+            for line in self.adb("forward", "--list").splitlines():
+                serial, local, remote = (line.split() + ["", "", ""])[:3]
+                if remote == f"localabstract:{AGENT_SOCKET}" and serial == (self.serial or serial):
+                    self.adb("forward", "--remove", local)
+            port = self._port = int(self.adb("forward", "tcp:0", f"localabstract:{AGENT_SOCKET}"))
             end = time.time() + 15
             while True:
                 try:
@@ -371,7 +378,9 @@ class AgentBackend(AndroidBackend):
                     pass  # not listening yet: adb accepts the connection and then drops it
                 if self._shell.poll() is not None:
                     log.seek(0)
-                    raise RuntimeError(f"droid-agent exited on start: {log.read().decode(errors='ignore').strip()}")
+                    output = log.read().decode(errors="ignore").strip()
+                    self._close()
+                    raise RuntimeError(f"droid-agent exited on start: {output}")
                 if time.time() >= end:
                     self._close()
                     raise RuntimeError("droid-agent did not start within 15 seconds")
@@ -385,6 +394,11 @@ class AgentBackend(AndroidBackend):
             self._shell.kill()
             self._shell.wait()
             self._shell = None
+        if self._port:
+            # If the device is gone, adb has already dropped its forwards.
+            with contextlib.suppress(RuntimeError, subprocess.TimeoutExpired):
+                self.adb("forward", "--remove", f"tcp:{self._port}")
+            self._port = None
 
     @staticmethod
     def _exchange(sock, reader, request):

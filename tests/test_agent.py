@@ -239,6 +239,43 @@ def test_start_pushes_the_jar_and_runs_it_under_adb_shell_with_a_token(starting)
     assert shell.stdin == subprocess.PIPE  # the agent exits when this closes
 
 
+def test_start_removes_forwards_left_by_earlier_agents_on_this_device(starting):
+    # A server that exits without closing (its client just went away) leaves its forward behind.
+    starting.device.forwards = (
+        "emulator-5554 tcp:50001 localabstract:droid-agent\n"
+        "emulator-5554 tcp:50002 tcp:8080\n"
+        "emulator-5556 tcp:50003 localabstract:droid-agent\n"
+    )
+    starting.connections = ["ours"]
+
+    starting.backend._call("hello")
+
+    removed = [c[2] for c in starting.device.calls if c[:2] == ("forward", "--remove")]
+    assert removed == ["tcp:50001"]  # not another app's forward, nor another device's agent
+
+
+def test_closing_removes_the_port_forward_it_opened(starting):
+    starting.connections = ["ours"]
+    starting.backend._call("hello")
+
+    starting.backend._close()
+
+    assert ("forward", "--remove", "tcp:40123") in starting.device.calls
+
+
+def test_closing_a_device_that_is_already_gone_still_closes(starting, monkeypatch):
+    starting.connections = ["ours"]
+    starting.backend._call("hello")
+
+    def gone(*args, **kwargs):
+        raise RuntimeError("adb: device 'emulator-5554' not found")
+
+    monkeypatch.setattr(starting.backend, "adb", gone)
+    starting.backend._close()
+
+    assert starting.shells[0].returncode == -9
+
+
 def test_start_waits_out_an_older_agent_still_holding_the_socket(starting):
     starting.connections = [ConnectionRefusedError(), "older", "ours"]
     starting.agent.show(HOME)
