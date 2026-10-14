@@ -14,6 +14,7 @@ Design goals (vs. generic mobile MCPs):
 Run:   uv sync
        claude mcp add droid -- uv run --directory /path/to/this/repo droid-mcp
 Env:   ANDROID_SERIAL=emulator-5554  SHOT_MAX_W=540  TRAJ_LOG=traj.jsonl
+       DROID_AGENT=1 drives the device through droid-agent (agent/build.sh) instead of uiautomator and input
 """
 
 import hashlib
@@ -21,11 +22,15 @@ import io
 import json
 import os
 import re
+import secrets
 import shlex
+import socket
 import struct
 import subprocess
+import tempfile
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP, Image
 from PIL import Image as PILImage
@@ -33,12 +38,24 @@ from PIL import Image as PILImage
 SERIAL = os.environ.get("ANDROID_SERIAL")
 MAX_W = int(os.environ.get("SHOT_MAX_W", "540"))
 TRAJ_LOG = os.environ.get("TRAJ_LOG")
+AGENT = os.environ.get("DROID_AGENT") == "1"
+AGENT_JAR = Path(__file__).with_name("agent") / "build" / "droid-agent.jar"  # built by agent/build.sh
+AGENT_REMOTE = "/data/local/tmp/droid-agent.jar"
+AGENT_SOCKET = "droid-agent"
+AGENT_QUIET_MS = 500  # the UI counts as settled once no accessibility event has arrived for this long
+AGENT_SETTLE_MS = 3000  # observe anyway after this long: a spinner or a video never goes quiet
 BOUNDS = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 KEYS = {"back": 4, "home": 3, "enter": 66, "recents": 187, "delete": 67}
 SWIPES = {"up": (0, 1), "down": (0, -1), "left": (1, 0), "right": (-1, 0)}  # finger travel, in thirds of the viewport
 KEYBOARD = "the keyboard"
 MIN_TAP = 16  # px; an exposed strip thinner than this is too close to whatever covers the rest
 TYPE_CHUNK = 6  # chars per `input text` call; a slow device drops whatever one call has not typed within ~10 s
+
+
+def _keycode(name):
+    if name not in KEYS:
+        raise ValueError(f"Unknown key {name!r}; use one of: {', '.join(KEYS)}")
+    return KEYS[name]
 
 
 def _rect(bounds):
@@ -278,9 +295,7 @@ class AndroidBackend:
                 self.adb("shell", "input", "text", shlex.quote(chunk.replace(" ", "%s")))
 
     def key(self, name):
-        if name not in KEYS:
-            raise ValueError(f"Unknown key {name!r}; use one of: {', '.join(KEYS)}")
-        self.adb("shell", "input", "keyevent", str(KEYS[name]))
+        self.adb("shell", "input", "keyevent", str(_keycode(name)))
 
     def launch(self, package):
         self.adb("shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1")
@@ -315,7 +330,132 @@ class AndroidBackend:
                 time.sleep(0.2)
 
 
-dev = AndroidBackend(SERIAL)
+class AgentBackend(AndroidBackend):
+    """Observes and acts through droid-agent (agent/), a process kept running on the device, instead of starting a
+    uiautomator or input process per call and waiting a fixed second for the UI to idle. Snapshots and the screen
+    size still go through adb."""
+
+    def __init__(self, serial=None):
+        super().__init__(serial)
+        self._conn = None  # (socket, reader) to the agent, opened on first use
+        self._shell = None  # the `adb shell` the agent runs under; the agent exits when it does
+        self._activity = None  # foreground activity the agent reported with the last dump
+
+    # ---------- connection ----------
+    def _open(self):
+        """Start a fresh agent and connect to it."""
+        if not AGENT_JAR.exists():
+            raise RuntimeError(f"{AGENT_JAR} is missing; build it with agent/build.sh")
+        self.adb("push", str(AGENT_JAR), AGENT_REMOTE)
+        # The token tells our agent apart from an older one that answers until ours takes the socket over.
+        token = secrets.token_hex(8)
+        with tempfile.TemporaryFile() as log:
+            self._shell = subprocess.Popen(
+                ["adb"]
+                + (["-s", self.serial] if self.serial else [])
+                + ["shell", f"CLASSPATH={AGENT_REMOTE} exec app_process / droid.agent.Server {token}"],
+                stdin=subprocess.PIPE,  # held open: the agent exits when it closes
+                stdout=log,
+                stderr=log,
+            )
+            port = int(self.adb("forward", "tcp:0", f"localabstract:{AGENT_SOCKET}"))
+            end = time.time() + 15
+            while True:
+                try:
+                    sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+                    conn = (sock, sock.makefile("rb"))
+                    if self._exchange(*conn, {"cmd": "hello"})[0].get("token") == token:
+                        return conn
+                    sock.close()
+                except (OSError, ValueError):
+                    pass  # not listening yet: adb accepts the connection and then drops it
+                if self._shell.poll() is not None:
+                    log.seek(0)
+                    raise RuntimeError(f"droid-agent exited on start: {log.read().decode(errors='ignore').strip()}")
+                if time.time() >= end:
+                    self._close()
+                    raise RuntimeError("droid-agent did not start within 15 seconds")
+                time.sleep(0.1)
+
+    def _close(self):
+        if self._conn:
+            self._conn[0].close()
+            self._conn = None
+        if self._shell:
+            self._shell.kill()
+            self._shell.wait()
+            self._shell = None
+
+    @staticmethod
+    def _exchange(sock, reader, request):
+        sock.sendall(json.dumps(request).encode() + b"\n")
+        line = reader.readline()
+        if not line:
+            raise ConnectionError("droid-agent closed the connection")
+        reply = json.loads(line)
+        payload = reader.read(reply["len"]) if "len" in reply else b""
+        if len(payload) != reply.get("len", 0):
+            raise ConnectionError("droid-agent closed the connection mid-reply")
+        return reply, payload
+
+    def _call(self, cmd, retry=False, **args):
+        """One request to the agent, starting it if need be. With retry, a dropped connection is retried once on a
+        fresh agent; actions are not retried, because the agent may have carried one out before the drop."""
+        for attempt in (1, 2):
+            if self._conn is None:
+                self._conn = self._open()
+            try:
+                reply, payload = self._exchange(*self._conn, {"cmd": cmd, **args})
+                break
+            except (OSError, ValueError) as e:
+                self._close()
+                if not retry or attempt == 2:
+                    raise RuntimeError(f"Lost the connection to droid-agent during {cmd}: {e}") from None
+        if not reply.get("ok"):
+            raise RuntimeError(f"droid-agent could not {cmd}: {reply.get('error')}")
+        return reply, payload
+
+    # ---------- observation ----------
+    def ui_xml(self):
+        reply, xml = self._call("dump", retry=True, quiet_ms=AGENT_QUIET_MS, timeout_ms=AGENT_SETTLE_MS)
+        self._activity = reply.get("activity")
+        return xml.decode()
+
+    def current_activity(self):
+        activity, self._activity = self._activity, None
+        return activity or super().current_activity()
+
+    def screenshot(self):
+        reply, jpeg = self._call("screenshot", retry=True, max_w=MAX_W)
+        self.scale = reply["scale"]
+        return jpeg
+
+    # ---------- actions ----------
+    def tap(self, x, y):
+        self._call("tap", x=x, y=y)
+
+    def swipe(self, x1, y1, x2, y2, ms=300):
+        self._call("swipe", x1=x1, y1=y1, x2=x2, y2=y2, ms=ms)
+
+    def text(self, s):
+        # The agent types keyboard characters as keys and inserts anything else, so there is no ASCII limit here.
+        if s:
+            self._call("text", text=s)
+
+    def key(self, name):
+        self._call("key", code=_keycode(name))
+
+    def launch(self, package):
+        # Through the agent, so it knows to wait for the app to draw before calling the screen settled.
+        self._call("launch", package=package)
+
+    def snapshot(self, op, name):
+        if op == "load":
+            self._close()  # the restore replaces every process on the device, the agent included
+        super().snapshot(op, name)
+
+
+dev = AgentBackend(SERIAL) if AGENT else AndroidBackend(SERIAL)
 mcp = FastMCP("droid")
 
 
@@ -365,9 +505,11 @@ def tap_xy(x: int, y: int, screenshot: bool = True):
     return _observe("tap_xy", {"x": x, "y": y}, screenshot)
 
 
-@mcp.tool()
+@mcp.tool(
+    description=f"Optionally focus an element, type text ({'any characters' if AGENT else 'printable ASCII only'}), "
+    "optionally press enter."
+)
 def type_text(text: str, element: int | None = None, submit: bool = False, screenshot: bool = True):
-    """Optionally focus an element, type text (printable ASCII only), optionally press enter."""
     if element is not None:
         dev.tap(*dev.point(element))
     dev.text(text)
