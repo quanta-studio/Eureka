@@ -30,7 +30,18 @@ public final class Server {
     static final String TAG = "droid-agent";
     static final String SOCKET = "droid-agent";
 
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) {
+        try {
+            run(args);
+        } catch (Throwable e) {
+            // app_process sends an uncaught exception to logcat only; the host reads this from stderr instead.
+            System.err.println(e.getMessage() != null ? e.getMessage() : e.toString());
+            System.err.flush();
+            System.exit(1);
+        }
+    }
+
+    private static void run(String[] args) throws Exception {
         String token = args.length > 0 ? args[0] : "";
         // The accessibility client posts to the main looper, which app_process does not create on its own.
         Looper.prepareMainLooper();

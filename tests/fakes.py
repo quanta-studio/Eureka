@@ -97,6 +97,7 @@ class FakeDevice:
         self.raw_header = 16
         self.activity = "com.android.settings/.Settings"
         self.emu_reply = "OK\n"
+        self.forwards = ""  # what `adb forward --list` prints
         self.pieces = []  # what each `input text` call typed, as the focused field would receive it
         self._argv = scratch / "argv"
         self._cwd = scratch / "device"
@@ -123,6 +124,8 @@ class FakeDevice:
             self.pieces.append(input_text_types(self._device_shell(args[1:])[1]))
         if args[:1] == ("emu",):
             return self.emu_reply
+        if args == ("forward", "--list"):
+            return self.forwards
         if args[:2] == ("forward", "tcp:0"):
             return "40123\n"  # adb picks a free host port and prints it
         return b"" if binary else ""
