@@ -2,9 +2,12 @@
 
 import functools
 import io
+import json
 import os
+import socket
 import struct
 import subprocess
+import threading
 from xml.sax.saxutils import quoteattr
 
 from PIL import Image as PILImage
@@ -120,6 +123,8 @@ class FakeDevice:
             self.pieces.append(input_text_types(self._device_shell(args[1:])[1]))
         if args[:1] == ("emu",):
             return self.emu_reply
+        if args[:2] == ("forward", "tcp:0"):
+            return "40123\n"  # adb picks a free host port and prints it
         return b"" if binary else ""
 
     def _device_shell(self, words):
@@ -154,3 +159,72 @@ class FakeDevice:
     @property
     def dumps(self):
         return sum(self._is_dump(c) for c in self.calls)
+
+
+@functools.lru_cache
+def jpeg(width, height):
+    buf = io.BytesIO()
+    PILImage.new("RGB", (width, height), COLOUR).save(buf, "JPEG")
+    return buf.getvalue()
+
+
+class FakeAgent:
+    """Speaks droid-agent's protocol from the far end of a socket pair, answering from canned state and recording
+    each request in order. `open` stands in for AgentBackend._open, so every call starts a fresh agent."""
+
+    READS = {"hello", "dump", "screenshot", "activity"}
+
+    def __init__(self):
+        self.requests = []
+        self.opened = 0
+        self.activity = "com.android.settings/.Settings"
+        self.shot = (jpeg(540, 1200), 2.0)  # what a 1080 px wide screen comes back as
+        self.errors = {}  # cmd -> the error the agent reports for it
+        self.drops = []  # cmds on which the connection drops instead of answering, once each
+        self.show(hierarchy())
+
+    def show(self, *screens):
+        """Serve these UI dumps in order; the last one stays on screen."""
+        self._screens = list(screens)
+
+    def open(self, token=""):
+        self.opened += 1
+        ours, theirs = socket.socketpair()
+        threading.Thread(target=self._serve, args=(theirs, token), daemon=True).start()
+        return ours, ours.makefile("rb")
+
+    @property
+    def actions(self):
+        """Every request that is not a read, as (cmd, args)."""
+        return [
+            (r["cmd"], {k: v for k, v in r.items() if k != "cmd"}) for r in self.requests if r["cmd"] not in self.READS
+        ]
+
+    def _serve(self, sock, token):
+        with sock, sock.makefile("rb") as requests:
+            for line in requests:
+                request = json.loads(line)
+                self.requests.append(request)
+                cmd = request["cmd"]
+                if cmd in self.drops:
+                    self.drops.remove(cmd)
+                    return
+                reply, payload = self._answer(request, token)
+                if payload:
+                    reply["len"] = len(payload)
+                data = json.dumps(reply).encode() + b"\n" + payload
+                for i in range(0, len(data), 4096):  # in pieces, the way a socket delivers a large reply
+                    sock.sendall(data[i : i + 4096])
+
+    def _answer(self, request, token):
+        cmd = request["cmd"]
+        if cmd in self.errors:
+            return {"ok": False, "error": self.errors[cmd]}, b""
+        if cmd == "hello":
+            return {"ok": True, "token": token}, b""
+        if cmd == "dump":
+            xml = self._screens.pop(0) if len(self._screens) > 1 else self._screens[0]
+            return {"ok": True, "settled": True, "activity": self.activity}, xml.encode()
+        if cmd == "screenshot":
+            return {"ok": True, "scale": self.shot[1]}, self.shot[0]
+        return {"ok": True}, b""

@@ -1,7 +1,7 @@
 import pytest
 
 import droid_mcp
-from tests.fakes import FakeClock, FakeDevice
+from tests.fakes import FakeAgent, FakeClock, FakeDevice
 
 
 @pytest.fixture
@@ -20,3 +20,17 @@ def device(monkeypatch, tmp_path):
     monkeypatch.setattr(droid_mcp.time, "time", clock.time)
     monkeypatch.setattr(droid_mcp.time, "sleep", clock.sleep)
     return fake
+
+
+@pytest.fixture
+def agent(device, monkeypatch):
+    """An AgentBackend wired in as the server's backend, talking to a FakeAgent. What still goes through adb
+    (snapshots, the screen size, dumpsys) is answered by the fake device."""
+    fake = FakeAgent()
+    fake.device = device
+    fake.backend = droid_mcp.AgentBackend()
+    monkeypatch.setattr(fake.backend, "adb", device.adb)
+    monkeypatch.setattr(fake.backend, "_open", fake.open)
+    monkeypatch.setattr(droid_mcp, "dev", fake.backend)
+    yield fake
+    fake.backend._close()
