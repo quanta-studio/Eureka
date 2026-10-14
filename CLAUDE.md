@@ -58,22 +58,34 @@ Environment variables, all read once at import:
 
 `droid_mcp.py` has two layers:
 
-- **`AndroidBackend`** does everything by shelling out to `adb`. There is no on-device agent or companion app: the tree comes from `uiautomator dump`, images from `screencap`, input from `adb shell input`, app launch from `monkey`, and snapshots from `adb emu avd snapshot`.
+- **`AndroidBackend`** does everything by shelling out to `adb`. There is no on-device agent or companion app: the tree comes from `uiautomator dump --windows`, images from `screencap`, input from `adb shell input`, app launch from `monkey`, and snapshots from `adb emu avd snapshot`.
 - **The tool layer** is a set of `@mcp.tool()` functions on the FastMCP server `droid`. Each is a thin wrapper that performs one action on the module-global `dev` and then returns `_observe(...)`.
 
-`_observe()` is the centre of the design. It runs `settle()`, then `compact_tree()`, then `_log()`, prepends the foreground activity, and optionally appends a screenshot. Every action tool returns it, and new action tools should too. `snapshot` is the only tool that doesn't.
+`_observe()` is the centre of the design. It runs `settle()`, then `compact_tree()`, then `_log()`, prepends the foreground activity (and `keyboard: showing` when it is), and optionally appends a screenshot. Every action tool returns it, and new action tools should too. `snapshot` is the only tool that doesn't.
 
-### State that couples the tools together
+### What `compact_tree()` works out
 
-- **Element indices are short-lived.** `dev.elements` maps index to the element's centre in device pixels and is rebuilt on every `compact_tree()` call. Because every action re-observes, indices are only valid against the most recent observation. Changing the filter in `compact_tree()` renumbers everything.
-- **There are two coordinate spaces.** Element centres, swipes, and `adb input` use device pixels. `tap_xy` takes screenshot pixels and multiplies by `dev.scale`.
+The dump covers every window, not just the app. `compact_tree()` lists the active window only and uses the others to decide what is reachable:
+
+- **`dev.elements` maps an index to a tap point, which is not always the centre.** Anything clickable drawn later, and any window stacked above, takes the touch, so the point moves to the roomiest exposed part of the element. A covered label resolves to its clickable row.
+- **`dev.covered` holds listed elements with nowhere left to tap**, with what hides them. They are flagged `covered` in the tree and `tap` refuses them. `tap_xy` is the escape hatch.
+- **`dev.viewport` is the part of the active window no other window sits over.** `swipe` stays inside it, because a swipe that starts on the keyboard types a character instead of scrolling.
+- **A container that is not itself clickable is never covered by its own children.** Without that rule every list and scroll view reads as covered.
+
+All three are rebuilt on every call, so indices are only valid against the most recent observation, and changing the listing filter renumbers everything.
+
+### Other things that couple the tools
+
+- **There are two coordinate spaces.** Tap points, swipes, and `adb input` use device pixels. `tap_xy` takes screenshot pixels and multiplies by `dev.scale`.
 - **`dev.scale` is only set by `screenshot()`.** Until a screenshot has been taken in the process, it is 1.0 and `tap_xy` coordinates are treated as device pixels.
-- **`settle()` dominates latency.** It needs two identical consecutive dumps, so every tool call costs at least two `uiautomator dump` round-trips, plus a `dumpsys` and the optional `screencap`. If the tree never stabilises within 5 seconds it returns the last dump without raising.
+- **`settle()` dominates latency.** It needs two identical consecutive dumps, and each `uiautomator dump` costs 2.5 to 3 seconds: over a second to start a Java process, then its own wait for the UI to go idle. If the tree never stabilises within 5 seconds it returns the last dump; if the device produces no tree at all (screen off) it raises.
+- **The dump is one `adb exec-out` round trip that deletes the file before and after.** `uiautomator` can report success without writing anything, and reading a leftover file would present a stale screen as current.
+- **Typed text goes through the device's shell**, so `text()` shell-quotes it. Dropping the quoting turns `type_text` into remote command execution.
+- **`input text` is the weak link for typing.** It handles printable ASCII only, turns `%s` into a space, and on a slow emulator silently drops whatever one call has not typed within about 10 seconds, hence the short `TYPE_CHUNK` pieces.
 - **`swipe(direction)` names the scroll direction, not the finger direction.** `down` drags the finger up to reveal content further down.
-- **`snapshot` is emulator-only**, since it goes through `adb emu`.
+- **`snapshot` is emulator-only**, since it goes through `adb emu`. The emulator console reports failure as `KO:` text with exit code 0, and a load drops the adb connection for about half a second, so `snapshot()` checks the text and waits for the device.
 - **One device per server process.** `dev` is bound at import from `ANDROID_SERIAL`.
-- **Bad arguments surface as raw `KeyError`s.** A stale `element`, or an unknown `key` or `direction`, fails in a dict lookup; there is no validation layer.
-- **The trajectory log is not replayable on its own.** Each line holds the action, its arguments, and an MD5 of the resulting compact tree, but not the tree or the screenshot.
+- **The trajectory log is not replayable on its own.** Each line holds the action, its arguments, and an MD5 of the resulting compact tree, but not the tree or the screenshot. Failed steps and `snapshot` calls are not logged.
 
 The server speaks MCP over stdio, so stdout is the protocol channel. Send debug output to stderr.
 
@@ -81,7 +93,8 @@ The server speaks MCP over stdio, so stdout is the protocol channel. Send debug 
 
 The suite never touches adb. The `device` fixture in `tests/conftest.py` replaces the module-global `dev` with a backend whose `adb` method is `FakeDevice.adb` (`tests/fakes.py`), which answers each command from canned state and records the calls. Tests then call the tool functions directly, since `@mcp.tool()` returns the original function, and assert on `device.inputs` and the returned observation.
 
-- Build UI dumps with `node()` and `hierarchy()`, and change the screen between steps with `device.show(...)`.
+- Build UI dumps with `node()` and `hierarchy()`, or `window()` and `windows()` when the keyboard or system bars matter, and change the screen between steps with `device.show(...)`.
+- For `input text`, the fake runs the command line through a real `sh` and applies Android's `%s` decoding, so `device.typed` is what the field would receive and `device.side_effects` shows anything the shell executed.
 - The fixture also swaps in a fake clock, so `settle()` polling takes no real time, and pins `MAX_W` and `TRAJ_LOG` so a developer's shell environment cannot change results.
 - The fake only encodes what we believe adb returns. A change to how the backend talks to a device still has to be exercised against a real emulator or device through an MCP client.
 

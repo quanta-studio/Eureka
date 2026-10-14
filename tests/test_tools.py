@@ -7,7 +7,7 @@ import pytest
 from PIL import Image as PILImage
 
 import droid_mcp
-from tests.fakes import hierarchy, node
+from tests.fakes import hierarchy, node, window, windows
 
 HOME = hierarchy(
     node(text="Network", clickable=True, bounds="[0,200][1080,400]"),
@@ -153,8 +153,98 @@ def test_every_step_appends_one_line_to_the_trajectory_log(device, monkeypatch, 
 
 
 def test_nothing_is_logged_when_no_trajectory_log_is_configured(device, tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
 
     droid_mcp.observe()
 
-    assert list(tmp_path.iterdir()) == []
+    assert list(cwd.iterdir()) == []
+
+
+# --- acting on what is really reachable -----------------------------------------------------------------------------
+
+STATUS_BAR = window(node(text="10:04", bounds="[20,10][120,60]"), bounds="[0,0][1080,142]", layer=2, kind="TYPE_SYSTEM")
+KEYBOARD = window(
+    node(text="q", clickable=True, bounds="[0,1600][108,1750]"),
+    bounds="[0,1541][1080,2400]",
+    layer=1,
+    kind="TYPE_INPUT_METHOD",
+)
+SEARCH = windows(
+    STATUS_BAR,
+    KEYBOARD,
+    window(
+        node(text="Results", bounds="[0,200][1080,300]"),
+        node(cls="android.widget.Button", text="Send", clickable=True, bounds="[800,1800][1000,1900]"),
+        bounds="[0,0][1080,2400]",
+        active=True,
+    ),
+)
+
+
+def test_observation_says_when_the_keyboard_is_showing(device):
+    device.show(SEARCH)
+    with_keyboard = droid_mcp.observe(screenshot=False)[0]
+    device.show(HOME)
+    without = droid_mcp.observe(screenshot=False)[0]
+
+    assert with_keyboard.splitlines()[:2] == ["activity: com.android.settings/.Settings", "keyboard: showing"]
+    assert "keyboard" not in without
+
+
+@pytest.mark.parametrize("direction", ["up", "down", "left", "right"])
+def test_swipe_stays_clear_of_the_keyboard_and_status_bar(device, direction):
+    device.show(SEARCH)
+    droid_mcp.observe(screenshot=False)
+
+    droid_mcp.swipe(direction, screenshot=False)
+
+    _, x1, y1, x2, y2, _ = device.inputs[0]
+    assert all(142 <= int(y) < 1541 for y in (y1, y2))
+    assert all(0 <= int(x) < 1080 for x in (x1, x2))
+    assert (x1, y1) != (x2, y2)
+
+
+def test_tapping_an_element_behind_the_keyboard_is_refused_with_the_reason(device):
+    device.show(SEARCH)
+    droid_mcp.observe(screenshot=False)
+
+    with pytest.raises(ValueError, match=r"\[1\].*the keyboard"):
+        droid_mcp.tap(1)
+
+    assert device.inputs == []
+
+
+def test_tapping_an_index_that_is_not_on_screen_names_the_valid_range(device):
+    device.show(HOME)
+    droid_mcp.observe(screenshot=False)
+
+    with pytest.raises(ValueError, match=r"\[999\].*\[0\].*\[1\]"):
+        droid_mcp.tap(999)
+
+    assert device.inputs == []
+
+
+def test_tapping_before_anything_was_observed_says_to_observe_first(device):
+    with pytest.raises(ValueError, match="observe"):
+        droid_mcp.tap(0)
+
+    assert device.inputs == []
+
+
+def test_type_text_into_an_unknown_element_types_nothing(device):
+    device.show(HOME)
+    droid_mcp.observe(screenshot=False)
+
+    with pytest.raises(ValueError, match=r"\[7\]"):
+        droid_mcp.type_text("hello", element=7)
+
+    assert device.inputs == []
+
+
+def test_unknown_swipe_direction_is_refused_with_the_valid_ones(device):
+    with pytest.raises(ValueError, match="diagonal.*up, down, left, right"):
+        droid_mcp.swipe("diagonal")
+
+    assert device.inputs == []

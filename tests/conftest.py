@@ -5,9 +5,9 @@ from tests.fakes import FakeClock, FakeDevice
 
 
 @pytest.fixture
-def device(monkeypatch):
+def device(monkeypatch, tmp_path):
     """A fake device wired in as the server's backend, isolated from the developer's environment."""
-    fake = FakeDevice()
+    fake = FakeDevice(tmp_path)
     fake.backend = droid_mcp.AndroidBackend()
     monkeypatch.setattr(fake.backend, "adb", fake.adb)
     monkeypatch.setattr(droid_mcp, "dev", fake.backend)
